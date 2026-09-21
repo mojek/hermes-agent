@@ -110,7 +110,7 @@ def _strip_resume_name(parts: list[str]) -> str:
 
 
 class GatewaySessionCommandsMixin:
-    """Session-transcript slash commands (/new, /resume, /sessions, /branch, /title, /save, /undo, /retry, /topic, /compress)."""
+    """Session-transcript slash commands (/new, /resume, /sessions, /branch, /title, /retitle, /save, /undo, /retry, /topic, /compress)."""
 
     # ------------------------------------------------------------------ /new, /reset
 
@@ -794,6 +794,47 @@ class GatewaySessionCommandsMixin:
         except Exception:
             logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
         return t("gateway.title.set_to", title=sanitized)
+
+    async def _handle_retitle_command(self, event: MessageEvent) -> str:
+        """Generate a fresh title from the current session's recent conversation."""
+        if not self._session_db:
+            return self._session_db_unavailable_reply()
+        source = event.source
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        try:
+            history = await self.async_session_store.load_transcript(session_entry.session_id)
+        except TranscriptReadError:
+            return HISTORY_UNREADABLE
+
+        from agent.session_retitle import (
+            RetitleGenerationError, RetitlePersistenceError, retitle_session,
+        )
+
+        session_db = getattr(self._session_db, "_db", self._session_db)
+        try:
+            title = await self._run_in_executor_with_context(
+                retitle_session, session_db, session_entry.session_id, history,
+            )
+        except RetitleGenerationError as exc:
+            logger.warning("Session retitle generation failed: %s", exc)
+            return f"Could not generate a new session title: {exc}"
+        except RetitlePersistenceError as exc:
+            logger.warning("Session retitle persistence failed: %s", exc)
+            return f"Generated a title, but could not save it: {exc}"
+        if not title:
+            return "Could not generate a title from this session's recent conversation."
+
+        if source.platform == Platform.TELEGRAM and source.thread_id:
+            try:
+                renamed = await self._rename_telegram_topic_for_session_title(
+                    source, session_entry.session_id, title,
+                )
+            except Exception:
+                logger.debug("Failed to rename Telegram topic after /retitle", exc_info=True)
+                renamed = False
+            if not renamed:
+                return f"Session retitled to: {title}\n\nThe Telegram topic could not be renamed."
+        return f"Session retitled to: {title}"
 
     # -------------------------------------------------------------- /resume, /sessions
 

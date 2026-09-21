@@ -492,14 +492,14 @@ class GatewayTopicThreadsMixin:
             return False
         return is_truthy_value((getattr(platform_cfg, "extra", None) or {}).get("disable_topic_auto_rename"))
 
-    async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
+    async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> bool:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
-            return
+            return False
         # Operator kill-switch, e.g. user-managed topics (ad-hoc Threaded Mode) that auto-rename
         # would keep overwriting.
         if self._telegram_topic_auto_rename_disabled(source):
-            return
+            return False
         # Skip operator-declared topics (extra.dm_topics): fixed names chosen by the operator;
         # auto-renaming would silently mutate operator config. Check the class, not the instance —
         # getattr() on a MagicMock auto-creates attributes, so every test double would match. Only
@@ -512,7 +512,7 @@ class GatewayTopicThreadsMixin:
             except Exception:
                 operator_topic = None
             if isinstance(operator_topic, dict):
-                return
+                return False
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
             try:
@@ -521,28 +521,35 @@ class GatewayTopicThreadsMixin:
                     profile_name=self._telegram_topic_profile_name(source),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
-                    return
+                    return False
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
-                return
+                return False
         if adapter is None:
-            return
+            return False
         topic_name = self._sanitize_telegram_topic_title(title)
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
                 await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name)
-                return
+                return True
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
             if edit_forum_topic is None:
-                return
+                return False
             try:
-                await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
+                chat_id = int(source.chat_id)
             except (TypeError, ValueError):
-                await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
+                chat_id = source.chat_id
+            try:
+                thread_id = int(source.thread_id)
+            except (TypeError, ValueError):
+                thread_id = source.thread_id
+            await edit_forum_topic(chat_id=chat_id, message_thread_id=thread_id, name=topic_name)
+            return True
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            return False
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────
 
