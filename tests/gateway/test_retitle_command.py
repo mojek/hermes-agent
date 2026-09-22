@@ -1,3 +1,4 @@
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,14 +9,14 @@ from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
 
-def _event(platform=Platform.TELEGRAM):
+def _event(platform=Platform.TELEGRAM, *, chat_type="dm", chat_id="67890"):
     return MessageEvent(
         text="/retitle",
         source=SessionSource(
             platform=platform,
             user_id="12345",
-            chat_id="67890",
-            chat_type="dm",
+            chat_id=chat_id,
+            chat_type=chat_type,
             thread_id="42" if platform == Platform.TELEGRAM else None,
         ),
     )
@@ -38,6 +39,7 @@ def _runner(db, history):
         side_effect=lambda function, *args: function(*args)
     )
     runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=True)
+    runner._rename_current_telegram_topic = AsyncMock(return_value=True)
     return runner
 
 
@@ -54,10 +56,54 @@ async def test_retitle_persists_then_renames_telegram_once_with_exact_stored_tit
         reply = await runner._handle_retitle_command(event)
 
     retitle.assert_called_once_with(db, "session-1", history)
-    runner._rename_telegram_topic_for_session_title.assert_awaited_once_with(
-        event.source, "session-1", "Persisted exact title"
+    runner._rename_current_telegram_topic.assert_awaited_once_with(
+        event.source, "Persisted exact title"
     )
     assert "Persisted exact title" in reply
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_type", "chat_id"),
+    [("dm", "67890"), ("group", "-10067890")],
+)
+async def test_retitle_renames_current_unmanaged_telegram_topic_with_delivery_adapter(
+    chat_type, chat_id,
+):
+    class Adapter:
+        def __init__(self):
+            self.rename_dm_topic = AsyncMock()
+
+    db = MagicMock()
+    db.is_telegram_topic_mode_enabled.return_value = False
+    runner = _runner(db, [{"role": "user", "content": "Rename this topic"}])
+    del runner._rename_telegram_topic_for_session_title
+    del runner._rename_current_telegram_topic
+    primary_adapter = Adapter()
+    delivery_adapter = Adapter()
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {"routed": {Platform.TELEGRAM: delivery_adapter}}
+    runner.config = SimpleNamespace(
+        platforms={
+            Platform.TELEGRAM: SimpleNamespace(
+                extra={"disable_topic_auto_rename": True},
+            )
+        }
+    )
+    event = _event(chat_type=chat_type, chat_id=chat_id)
+    event.source.profile = "routed"
+    event.source._transport_adapter_ref = weakref.ref(delivery_adapter)
+
+    with patch("agent.session_retitle.retitle_session", return_value="Explicit topic title"):
+        reply = await runner._handle_retitle_command(event)
+
+    delivery_adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id=chat_id,
+        thread_id="42",
+        name="Explicit topic title",
+    )
+    primary_adapter.rename_dm_topic.assert_not_awaited()
+    assert reply == "Session retitled to: Explicit topic title"
 
 
 @pytest.mark.asyncio
@@ -69,19 +115,19 @@ async def test_retitle_never_renames_non_telegram_and_reports_known_telegram_fai
         reply = await discord_runner._handle_retitle_command(_event(Platform.DISCORD))
 
     assert "Gateway titles" in reply
-    discord_runner._rename_telegram_topic_for_session_title.assert_not_awaited()
+    discord_runner._rename_current_telegram_topic.assert_not_awaited()
 
     telegram_runner = _runner(MagicMock(), history)
-    telegram_runner._rename_telegram_topic_for_session_title.return_value = False
+    telegram_runner._rename_current_telegram_topic.return_value = False
     with patch("agent.session_retitle.retitle_session", return_value="Stored despite rename"):
         partial = await telegram_runner._handle_retitle_command(_event())
 
-    telegram_runner._rename_telegram_topic_for_session_title.assert_awaited_once()
+    telegram_runner._rename_current_telegram_topic.assert_awaited_once()
     assert "Stored despite rename" in partial
     assert "topic" in partial.lower()
     assert "could not" in partial.lower()
 
-    telegram_runner._rename_telegram_topic_for_session_title.side_effect = RuntimeError("Telegram unavailable")
+    telegram_runner._rename_current_telegram_topic.side_effect = RuntimeError("Telegram unavailable")
     with patch("agent.session_retitle.retitle_session", return_value="Still stored"):
         partial = await telegram_runner._handle_retitle_command(_event())
 

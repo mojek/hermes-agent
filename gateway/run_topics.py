@@ -525,6 +525,14 @@ class GatewayTopicThreadsMixin:
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
                 return False
+
+        return await self._rename_current_telegram_topic(source, title)
+
+    async def _rename_current_telegram_topic(self, source: SessionSource, title: str) -> bool:
+        """Best-effort rename of the exact Telegram topic identified by an inbound source."""
+        if source.platform != Platform.TELEGRAM or not source.chat_id or not source.thread_id:
+            return False
+        adapter = self._adapter_for_source(source)
         if adapter is None:
             return False
         topic_name = self._sanitize_telegram_topic_title(title)
@@ -548,7 +556,7 @@ class GatewayTopicThreadsMixin:
             await edit_forum_topic(chat_id=chat_id, message_thread_id=thread_id, name=topic_name)
             return True
         except Exception:
-            logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            logger.debug("Failed to rename current Telegram topic", exc_info=True)
             return False
 
     # ── /topic command bodies ───────────────────────────────────────────────────────────────

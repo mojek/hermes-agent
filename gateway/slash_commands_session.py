@@ -824,11 +824,9 @@ class GatewaySessionCommandsMixin:
         if not title:
             return "Could not generate a title from this session's recent conversation."
 
-        if source.platform == Platform.TELEGRAM and source.thread_id:
+        if source.platform == Platform.TELEGRAM and source.chat_id and source.thread_id:
             try:
-                renamed = await self._rename_telegram_topic_for_session_title(
-                    source, session_entry.session_id, title,
-                )
+                renamed = await self._rename_current_telegram_topic(source, title)
             except Exception:
                 logger.debug("Failed to rename Telegram topic after /retitle", exc_info=True)
                 renamed = False

@@ -152,3 +152,37 @@ def test_title_thread_copy_preserves_transport_adapter_ref(monkeypatch):
     assert copied is not source
     assert copied.profile == "runtime-profile"
     assert copied._transport_adapter_ref() is adapter
+
+
+@pytest.mark.anyio
+async def test_automatic_telegram_title_rename_refuses_unmanaged_topic():
+    calls = []
+
+    class Adapter:
+        async def rename_dm_topic(self, **kwargs):
+            calls.append(kwargs)
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = types.SimpleNamespace(
+        _db=types.SimpleNamespace(
+            is_telegram_topic_mode_enabled=lambda **_kwargs: False,
+        )
+    )
+    runner.adapters = {Platform.TELEGRAM: Adapter()}
+    runner.config = types.SimpleNamespace(platforms={})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="12345",
+        chat_id="67890",
+        chat_type="dm",
+        thread_id="42",
+    )
+
+    renamed = await runner._rename_telegram_topic_for_session_title(
+        source,
+        "session-1",
+        "Automatic title",
+    )
+
+    assert renamed is False
+    assert calls == []
