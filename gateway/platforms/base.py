@@ -1703,6 +1703,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     replace."""
     existing = pending_messages.get(session_key)
     if existing:
+        incoming_waiter = getattr(event, "_gateway_response_future", None)
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -1734,12 +1735,19 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            if incoming_waiter is not None and not incoming_waiter.done():
+                incoming_waiter.set_exception(RuntimeError("Queued response-wait event was merged"))
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            if incoming_waiter is not None and not incoming_waiter.done():
+                incoming_waiter.set_exception(RuntimeError("Queued response-wait event was merged"))
             return
+        existing_waiter = getattr(existing, "_gateway_response_future", None)
+        if existing_waiter is not None and not existing_waiter.done():
+            existing_waiter.set_exception(RuntimeError("Queued response-wait event was superseded"))
     pending_messages[session_key] = event
 
 
@@ -3728,6 +3736,27 @@ class BasePlatformAdapter(ABC):
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
+    async def handle_message_and_wait(self, event: MessageEvent) -> str:
+        """Dispatch normally, including final platform delivery, and await its response text.
+
+        This process-local future does not alter the event schema, prompt, toolset, or persisted
+        conversation. It exists for transports that must relay the already-produced final text.
+        """
+        session_key = self._event_session_key(event)
+        locks = getattr(self, "_response_wait_locks", None)
+        if locks is None:
+            locks = self._response_wait_locks = {}
+        lock = locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            future = asyncio.get_running_loop().create_future()
+            event._gateway_response_future = future
+            await self.handle_message(event)
+            if not event._gateway_accepted:
+                if not future.done():
+                    future.cancel()
+                raise RuntimeError("Gateway did not accept the response-wait event")
+            return await future
+
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
@@ -3844,7 +3873,8 @@ class BasePlatformAdapter(ABC):
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
-            self._should_auto_tts_for_chat(event.source.chat_id)
+            not (event.metadata or {}).get("suppress_auto_tts")
+            and self._should_auto_tts_for_chat(event.source.chat_id)
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
@@ -4017,14 +4047,15 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
-        """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> bool:
+        """Send a normal-lane final and return whether the platform accepted delivery."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        return bool(result.success)
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
@@ -4163,6 +4194,7 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        response_for_waiter = ""
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -4180,6 +4212,10 @@ class BasePlatformAdapter(ABC):
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            waiter = getattr(event, "_gateway_response_future", None)
+            if response and waiter is not None and waiter.cancelled():
+                logger.info("[%s] Suppressing response for cancelled response-wait event", self.name)
+                response = None
             # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
             if response and interrupt_event.is_set() and session_key in self._pending_messages:
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
@@ -4211,9 +4247,11 @@ class BasePlatformAdapter(ABC):
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    final_text_delivered = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    if final_text_delivered:
+                        response_for_waiter = text_content
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
@@ -4226,6 +4264,9 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
+            waiter = getattr(event, "_gateway_response_future", None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(response_for_waiter)
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
@@ -4237,12 +4278,18 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            waiter = getattr(event, "_gateway_response_future", None)
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            waiter = getattr(event, "_gateway_response_future", None)
+            if waiter is not None and not waiter.done():
+                waiter.set_exception(RuntimeError("Gateway response processing failed"))
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4266,6 +4313,18 @@ class BasePlatformAdapter(ABC):
         follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
         live for concurrent inbound; ownership moves so stale-lock detection works."""
         self._clear_session_guard(session_key)
+        while True:
+            waiter = getattr(pending_event, "_gateway_response_future", None)
+            if waiter is None or not waiter.cancelled():
+                break
+            logger.debug("[%s] Dropping cancelled queued response-wait event", self.name)
+            promote = getattr(self.gateway_runner, "_promote_queued_event", None)
+            if not callable(promote):
+                return
+            promoted = promote(session_key, self, None)
+            if not isinstance(promoted, MessageEvent):
+                return
+            pending_event = promoted
         self._track_session_task(
             session_key,
             asyncio.create_task(self._process_message_background(pending_event, session_key)))

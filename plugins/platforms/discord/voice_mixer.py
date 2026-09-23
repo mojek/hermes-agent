@@ -7,6 +7,7 @@ discord.py's sender thread while children change on the asyncio loop, hence the 
 
 import logging
 import threading
+from collections import deque
 from typing import TYPE_CHECKING, List, Optional
 
 import discord
@@ -88,6 +89,7 @@ class VoiceMixer(discord.AudioSource):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
         self._speech: List[MixerChild] = []
+        self._speech_queue = deque()
         self._ambient_gain, self._duck_gain, self._speech_gain = float(ambient_gain), float(duck_gain), float(speech_gain)
         # When speech ends, ramp the ambient back up over this many frames instead of jumping.
         self._duck_release_frames = max(1, duck_release_ms // FRAME_LENGTH_MS)
@@ -118,6 +120,19 @@ class VoiceMixer(discord.AudioSource):
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def queue_speech(self, pcm: bytes, *, gain: Optional[float] = None, fade_in_ms: int = 0) -> None:
+        """Queue a speech segment after earlier queued segments, without overlap."""
+        if not pcm:
+            return
+        with self._lock:
+            self._speech_queue.append([
+                bytearray(pcm), self._speech_gain if gain is None else float(gain),
+            ])
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -127,7 +142,12 @@ class VoiceMixer(discord.AudioSource):
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
             self._speech.clear()
+            self._speech_queue.clear()
             self._begin_duck_release_locked()
+
+    def clear_speech(self) -> None:
+        """Alias used by realtime barge-in to invalidate all pending speech."""
+        self.stop_speech()
 
     def _begin_duck_release_locked(self) -> None:
         self._speech_active = False
@@ -151,8 +171,25 @@ class VoiceMixer(discord.AudioSource):
                     acc = frame if acc is None else acc + frame
                     still_live.append(child)
                 self._speech = still_live
-                if not self._speech and self._speech_active:
-                    self._begin_duck_release_locked()
+            if self._speech_queue:
+                queued = np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+                sample_pos = 0
+                while self._speech_queue and sample_pos < queued.size:
+                    pcm, gain = self._speech_queue[0]
+                    take = min(len(pcm), (queued.size - sample_pos) * SAMPLE_WIDTH)
+                    take -= take % SAMPLE_WIDTH
+                    if not take:
+                        self._speech_queue.popleft()
+                        continue
+                    samples = np.frombuffer(bytes(pcm[:take]), dtype=np.int16).astype(np.float32)
+                    queued[sample_pos:sample_pos + len(samples)] = samples * gain
+                    sample_pos += len(samples)
+                    del pcm[:take]
+                    if not pcm:
+                        self._speech_queue.popleft()
+                acc = queued if acc is None else acc + queued
+            if not self._speech and not self._speech_queue and self._speech_active:
+                self._begin_duck_release_locked()
             # Ambient bed — ramp gain back up during duck-release.
             if self._ambient is not None:
                 if self._duck_release_left > 0 and not self._speech_active:
@@ -174,6 +211,7 @@ class VoiceMixer(discord.AudioSource):
             self._closed = True
             self._ambient = None
             self._speech.clear()
+            self._speech_queue.clear()
 
 
 def decode_to_pcm(path: str, *, timeout: float = 30.0) -> Optional[bytes]:
