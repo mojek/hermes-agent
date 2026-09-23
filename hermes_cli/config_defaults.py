@@ -1489,6 +1489,13 @@ DEFAULT_CONFIG = {
         # Minimum seconds before force-stopping a VC playback; the adapter probes clip duration and
         # extends this floor so long TTS isn't cut off.
         "voice_playback_timeout_seconds": 120,
+        "live_voice": {
+            "enabled": False,
+            "model": "gpt-realtime-2.1",
+            "voice": "cedar",
+            "max_session_seconds": 3600,
+            "idle_seconds": 300,
+        },
         # Voice-channel software mixer (plugins/platforms/discord/voice_mixer.py): ambient
         # "thinking" bed, verbal acks and TTS OVERLAP (ambient ducked) vs stop-and-swap.
         "voice_fx": {

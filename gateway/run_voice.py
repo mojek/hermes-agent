@@ -176,6 +176,32 @@ class GatewayVoiceMixin:
         return (f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect.")
 
+    async def _handle_voice_channel_live(self, event: MessageEvent) -> str:
+        """Start Discord's full-duplex Realtime voice UI on the existing TARS session."""
+        adapter = self._adapter_for_source(event.source)
+        if not adapter or not hasattr(adapter, "start_live_voice"):
+            return "Live voice is not supported on this platform."
+        if not self._is_user_authorized_for_source(event.source):
+            return "You are not authorized to start live voice."
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return "This command only works in a Discord server."
+        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
+        if not voice_channel:
+            return "You need to be in a voice channel first."
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = functools.partial(
+                self._handle_voice_timeout_cleanup, adapter=adapter)
+        delegate = functools.partial(
+            self._handle_live_voice_input, guild_id, adapter=adapter,
+        )
+        return await adapter.start_live_voice(
+            voice_channel,
+            text_channel_id=int(event.source.chat_id),
+            source=event.source.to_dict(),
+            delegate=delegate,
+        )
+
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._adapter_for_source(event.source)
         guild_id = self._get_guild_id(event)
@@ -234,16 +260,15 @@ class GatewayVoiceMixin:
             user_name=str(user_id), chat_type="channel",
             profile=getattr(adapter, "_owner_profile", None))
 
-    async def _handle_voice_channel_input(
+    async def _build_voice_channel_event(
         self, guild_id: int, user_id: int, transcript: str, *, adapter=None
-    ):
-        """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
-        multiplexing each profile's bot dispatches through its own adapter, never the default's."""
+    ) -> Optional[MessageEvent]:
+        """Build the canonical authorized, deduplicated voice event and publish its transcript."""
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
         text_ch_id = adapter._voice_text_channels.get(guild_id) if adapter else None
         if not text_ch_id:
-            return
+            return None
         source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
         # Validate the session owner against the current allowlist before auto-resuming. A session created
         # before TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or before the owner was removed from
@@ -251,11 +276,11 @@ class GatewayVoiceMixin:
         # resume-pending marker (issue #23778).
         if not self._is_user_authorized_for_source(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
-            return
+            return None
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info("Suppressing duplicate voice transcript for guild=%s user=%s: %s",
                         guild_id, user_id, transcript[:100])
-            return
+            return None
         # Echo the transcript into the text channel (after auth, with mention sanitization).
         with suppress(Exception):
             channel = adapter._client.get_channel(text_ch_id)
@@ -271,11 +296,38 @@ class GatewayVoiceMixin:
                 channel_prompt = resolved if isinstance(resolved, str) else None
         # Synthetic MessageEvent for the normal pipeline; the SimpleNamespace raw_message lets
         # _get_guild_id() extract guild_id so _send_voice_reply() plays audio in the voice channel.
-        event = MessageEvent(
+        return MessageEvent(
             source=source, text=transcript, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt)
+
+    async def _handle_voice_channel_input(
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+    ):
+        """Dispatch sequential voice input through the normal gateway path."""
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        event = await self._build_voice_channel_event(
+            guild_id, user_id, transcript, adapter=adapter,
+        )
+        if event is None:
+            return
         await adapter.handle_message(event)
+
+    async def _handle_live_voice_input(
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None,
+    ) -> str:
+        """Dispatch live text through the same path and relay the delivered TARS final."""
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
+        event = await self._build_voice_channel_event(
+            guild_id, user_id, transcript, adapter=adapter,
+        )
+        if event is None:
+            return ""
+        event.metadata["suppress_auto_tts"] = True
+        event.allow_gateway_control = False
+        return await adapter.handle_message_and_wait(event)
 
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False
@@ -284,6 +336,8 @@ class GatewayVoiceMixin:
         already called text_to_speech this turn, or voice input + base adapter auto-TTS handled it
         — UNLESS streaming consumed the response (already_sent): then the runner must do it."""
         if not response or response.startswith("Error:"):
+            return False
+        if (event.metadata or {}).get("suppress_auto_tts"):
             return False
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))

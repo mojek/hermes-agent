@@ -647,6 +647,8 @@ class GatewaySlashCommandsMixin(
             return t(reply_key)
         if args in {"channel", "join"}:
             return await self._handle_voice_channel_join(event)
+        if args == "live":
+            return await self._handle_voice_channel_live(event)
         if args == "leave":
             return await self._handle_voice_channel_leave(event)
         if args == "status":

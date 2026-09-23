@@ -10,6 +10,7 @@ Uses discord.py library for:
 """
 
 import asyncio
+import contextvars
 import datetime as dt
 import hashlib
 import inspect
@@ -47,6 +48,16 @@ def _voice_mixer_module():
     except ImportError:
         from . import voice_mixer
         return voice_mixer
+
+
+def _realtime_voice_module():
+    """Sibling ``realtime_voice`` module with a patchable package import in tests."""
+    try:
+        import realtime_voice
+        return realtime_voice
+    except ImportError:
+        from . import realtime_voice
+        return realtime_voice
 
 
 def _image_ext_from_content_type(content_type: str) -> str:
@@ -136,9 +147,10 @@ _NATIVE_SLASH_COMMANDS: tuple = (
     ("reload-mcp", "Reload MCP servers from config", (), "/reload-mcp", None),
     ("reload-skills", "Re-scan ~/.hermes/skills/ for new or removed skills", (), "/reload-skills", None),
     ("voice", "Toggle voice reply mode",
-     (("mode", str, "", "Voice mode: join, channel, leave, on, tts, off, or status",
+     (("mode", str, "", "Voice mode: live, join, channel, leave, on, tts, off, or status",
        # `join` and `channel` both hit _handle_voice_channel_join; expose both to match docs.
-       (("join — join your voice channel", "join"), ("channel — join your voice channel (alias)", "channel"),
+       (("live — full-duplex GPT Live voice", "live"), ("join — join your voice channel", "join"),
+        ("channel — join your voice channel (alias)", "channel"),
         ("leave — leave voice channel", "leave"), ("on — voice reply to voice messages", "on"),
         ("tts — voice reply to all messages", "tts"), ("off — text only", "off"),
         ("status — show current mode", "status"))),),
@@ -667,6 +679,7 @@ class VoiceReceiver:
         self._decoders: Dict[int, object] = {}
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
+        self._live_pcm_callback: Optional[Callable[[int, bytes], None]] = None
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
@@ -836,11 +849,26 @@ class VoiceReceiver:
             with self._lock:
                 self._buffers[ssrc].extend(pcm)
                 self._last_packet_time[ssrc] = time.monotonic()
+            self._emit_live_pcm(ssrc, pcm)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+
+    def _emit_live_pcm(self, ssrc: int, pcm: bytes) -> None:
+        """Forward decoded PCM only after Discord has mapped the SSRC to a user."""
+        callback = self._live_pcm_callback
+        if callback is None:
+            return
+        with self._lock:
+            user_id = self._ssrc_to_user.get(ssrc)
+        if not user_id:
+            return
+        try:
+            callback(user_id, pcm)
+        except Exception:
+            logger.warning("Discord live PCM callback failed")
 
     # --- Silence detection ---
 
@@ -1048,6 +1076,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
         # Continuous voice mixer per guild (ambient bed + ducked speech) so acks/TTS/thinking overlap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        self._live_voice_sessions: Dict[int, Any] = {}  # guild_id -> RealtimeVoiceClient
+        self._live_voice_locks: Dict[int, asyncio.Lock] = {}
+        self._closing_live_guilds: set[int] = set()
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
@@ -1327,6 +1358,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if guild_id not in bot_guild_ids:
                     return
                 if member == adapter_self._client.user:
+                    if before.channel is not None and after.channel is None:
+                        await adapter_self._handle_voice_disconnect(guild_id)
                     return
                 joined = before.channel is None and after.channel is not None
                 left = before.channel is not None and after.channel is None
@@ -1863,7 +1896,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         await self._cancel_liveness_task()
         # Leave voice *before* cancelling the bot task: VoiceClient.disconnect() needs the main
         # gateway WS (run by the bot task) or it blocks until the timeout.
-        for guild_id in list(self._voice_clients.keys()):
+        voice_guild_ids = set(self._voice_clients) | set(getattr(self, "_live_voice_sessions", {}))
+        for guild_id in voice_guild_ids:
             try:
                 await self.leave_voice_channel(guild_id)
             except Exception as e:  # pragma: no cover - defensive logging
@@ -3348,7 +3382,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._ambient_pcm_cache = pcm
         return pcm
 
-    async def _install_voice_mixer(self, guild_id: int, vc) -> None:
+    async def _install_voice_mixer(self, guild_id: int, vc, *, ambient_enabled: bool = True) -> None:
         """Install a VoiceMixer on the VC; one ``vc.play(mixer)`` runs for the whole connection."""
         VoiceMixer = _voice_mixer_module().VoiceMixer
         mixer = VoiceMixer(
@@ -3356,7 +3390,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
             speech_gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
         )
-        ambient = await asyncio.to_thread(self._get_ambient_pcm)
+        ambient = await asyncio.to_thread(self._get_ambient_pcm) if ambient_enabled else None
         if ambient:
             mixer.set_ambient(ambient)
 
@@ -3432,6 +3466,105 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    async def _handle_voice_disconnect(self, guild_id: int) -> None:
+        """Clean local/live state after Discord reports that the bot was disconnected."""
+        await self.leave_voice_channel(guild_id)
+
+    async def start_live_voice(
+        self, channel, *, text_channel_id: int, source: dict, delegate: Callable[[str], Any],
+    ) -> str:
+        """Start one ready-confirmed Realtime session for ``channel.guild``."""
+        rv = _realtime_voice_module()
+        config = rv.load_live_voice_config()
+        if not config.enabled:
+            return "Discord live voice is disabled in config.yaml."
+        from agent import secret_scope
+        api_key = (secret_scope.get_secret("OPENAI_API_KEY", "") or "").strip()
+        if not api_key:
+            return "Discord live voice requires OPENAI_API_KEY."
+
+        guild_id = int(channel.guild.id)
+        lock = self._live_voice_locks.setdefault(guild_id, asyncio.Lock())
+        async with lock:
+            current = self._live_voice_sessions.get(guild_id)
+            if current is not None and not getattr(current, "closed", False):
+                return "A live voice session is already running in this server."
+            if not await self.join_voice_channel(
+                channel, text_channel_id=text_channel_id, source=source,
+            ):
+                return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
+            self._cancel_voice_timeout(guild_id)
+            receiver = getattr(self, "_voice_receivers", {}).get(guild_id)
+            if receiver is None or not getattr(receiver, "_running", False):
+                await self.leave_voice_channel(guild_id)
+                return "Failed to start Discord live voice input."
+            mixer = self._voice_mixers.get(guild_id)
+            if mixer is None:
+                vc = self._voice_clients.get(guild_id)
+                if vc is None:
+                    return "Failed to prepare live voice playback."
+                try:
+                    await self._install_voice_mixer(guild_id, vc, ambient_enabled=False)
+                except Exception:
+                    logger.warning("Discord live voice mixer failed to start")
+                    await self.leave_voice_channel(guild_id)
+                    return "Failed to prepare live voice playback."
+                mixer = self._voice_mixers[guild_id]
+
+            client = None
+
+            async def _on_closed() -> None:
+                if guild_id not in self._closing_live_guilds and self.is_in_voice_channel(guild_id):
+                    await self.leave_voice_channel(guild_id)
+                elif self._live_voice_sessions.get(guild_id) is client:
+                    self._live_voice_sessions.pop(guild_id, None)
+
+            async def _delegate_for_speaker(user_id: int, prompt: str) -> str:
+                return await delegate(user_id, prompt)
+
+            client = rv.RealtimeVoiceClient(
+                config=config, api_key=api_key, mixer=mixer, delegate=_delegate_for_speaker,
+                on_closed=_on_closed,
+            )
+            self._live_voice_sessions[guild_id] = client
+            try:
+                await client.start()
+            except Exception:
+                self._live_voice_sessions.pop(guild_id, None)
+                logger.warning("OpenAI Realtime session failed before readiness")
+                await self.leave_voice_channel(guild_id)
+                return "Failed to start OpenAI Realtime live voice."
+            receiver._live_pcm_callback = self._live_pcm_callback(guild_id, client)
+            return f"Live voice is ready in **{channel.name}**. Use /voice leave to disconnect."
+
+    def _live_pcm_callback(self, guild_id: int, client) -> Callable[[int, bytes], None]:
+        """Authorize mapped speakers on the owning profile's event-loop context."""
+        loop = asyncio.get_running_loop()
+        profile_context = contextvars.copy_context()
+        authorization_cache: Dict[int, Tuple[bool, float]] = {}
+
+        def _authorize_and_feed(user_id: int, pcm: bytes) -> None:
+            guild = self._client.get_guild(guild_id) if self._client is not None else None
+            now = time.monotonic()
+            cached = authorization_cache.get(user_id)
+            if cached is None or now - cached[1] >= 1.0:
+                cached = (
+                    bool(
+                        guild is not None
+                        and self._is_allowed_user(str(user_id), guild=guild, is_dm=False)
+                    ),
+                    now,
+                )
+                authorization_cache[user_id] = cached
+            if cached[0]:
+                client.feed_discord_pcm(user_id, pcm)
+
+        def _forward(user_id: int, pcm: bytes) -> None:
+            loop.call_soon_threadsafe(
+                _authorize_and_feed, user_id, pcm, context=profile_context,
+            )
+        return _forward
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a voice channel; returns True on success. ``text_channel_id`` stores the
         transcription-routing binding so programmatic joins work without ``/voice join``."""
@@ -3441,6 +3574,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
+                if text_channel_id is not None:
+                    self._voice_text_channels[guild_id] = text_channel_id
+                if source is not None:
+                    self._voice_sources[guild_id] = source
                 if existing.channel.id == channel.id:
                     self._reset_voice_timeout(guild_id)
                     return True
@@ -3474,6 +3611,16 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            live_sessions = getattr(self, "_live_voice_sessions", {})
+            live_client = live_sessions.pop(guild_id, None)
+            was_live = live_client is not None
+            if live_client is not None:
+                closing_live_guilds = getattr(self, "_closing_live_guilds", set())
+                closing_live_guilds.add(guild_id)
+                try:
+                    await live_client.close()
+                finally:
+                    closing_live_guilds.discard(guild_id)
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:
@@ -3483,9 +3630,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if listen_task:
                 listen_task.cancel()
             guild = self._client.get_guild(guild_id) if self._client is not None else None
-            for user_id, pcm_data in pending_inputs:
-                if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+            if not was_live:
+                for user_id, pcm_data in pending_inputs:
+                    if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                        await self._process_voice_input(guild_id, user_id, pcm_data)
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
@@ -3709,6 +3857,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     except Exception:
                         pass
                 completed = receiver.check_silence()
+                live_client = getattr(self, "_live_voice_sessions", {}).get(guild_id)
+                if live_client is not None and not getattr(live_client, "closed", False):
+                    continue
                 # Pass guild so role checks stay guild-scoped.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
                 for user_id, pcm_data in completed:

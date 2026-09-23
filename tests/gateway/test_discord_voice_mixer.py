@@ -62,6 +62,34 @@ class TestVoiceMixerCore:
         assert any(p > 0 for p in peaks[10:])
         assert max(peaks) < int(32767 * 0.5)
 
+    def test_streaming_speech_queue_is_sequential_and_clearable(self):
+        mx = vm.VoiceMixer()
+        first = np.full(vm.SAMPLES_PER_FRAME * vm.CHANNELS, 1000, dtype=np.int16).tobytes()
+        second = np.full(vm.SAMPLES_PER_FRAME * vm.CHANNELS, 2000, dtype=np.int16).tobytes()
+
+        mx.queue_speech(first, fade_in_ms=0)
+        mx.queue_speech(second, fade_in_ms=0)
+
+        assert np.all(np.frombuffer(mx.read(), dtype=np.int16) == 1000)
+        assert np.all(np.frombuffer(mx.read(), dtype=np.int16) == 2000)
+        mx.queue_speech(first, fade_in_ms=0)
+        mx.clear_speech()
+        assert mx.speech_active is False
+        assert mx.read() == vm.SILENCE_FRAME
+
+    def test_streaming_queue_preserves_non_frame_chunk_boundaries(self):
+        mx = vm.VoiceMixer()
+        half_samples = vm.SAMPLES_PER_FRAME * vm.CHANNELS // 2
+        first = np.full(half_samples, 1000, dtype=np.int16).tobytes()
+        second = np.full(half_samples, 2000, dtype=np.int16).tobytes()
+
+        mx.queue_speech(first)
+        mx.queue_speech(second)
+
+        frame = np.frombuffer(mx.read(), dtype=np.int16)
+        assert np.all(frame[:half_samples] == 1000)
+        assert np.all(frame[half_samples:] == 2000)
+
 
 # =====================================================================
 # Adapter integration
@@ -128,6 +156,7 @@ class TestPlayInVoiceChannelMixerPath:
         mixer = _Mixer()
         adapter._voice_mixers[111] = mixer
         adapter._reset_voice_timeout = MagicMock()
+        adapter._playback_timeout_for_audio = AsyncMock(return_value=120.0)
 
         fake_pcm = b"\x00" * vm.FRAME_SIZE
         with patch.object(vm, "decode_to_pcm", return_value=fake_pcm):
@@ -161,5 +190,3 @@ class TestPlayAckInVoice:
         adapter = _make_adapter({"ack_enabled": False})
         adapter._voice_mixers[111] = MagicMock()
         assert await adapter.play_ack_in_voice(111) is False
-
-

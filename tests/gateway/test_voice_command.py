@@ -122,6 +122,18 @@ class TestHandleVoiceCommand:
         data = json.loads(runner._VOICE_MODE_PATH.read_text())
         assert data["telegram:123"] == "voice_only"
 
+    @pytest.mark.asyncio
+    async def test_live_dispatches_without_changing_join_fallback(self, runner):
+        live_event = _make_event("/voice live")
+        join_event = _make_event("/voice join")
+        runner._handle_voice_channel_live = AsyncMock(return_value="live-ready")
+        runner._handle_voice_channel_join = AsyncMock(return_value="joined")
+
+        assert await runner._handle_voice_command(live_event) == "live-ready"
+        assert await runner._handle_voice_command(join_event) == "joined"
+        runner._handle_voice_channel_live.assert_awaited_once_with(live_event)
+        runner._handle_voice_channel_join.assert_awaited_once_with(join_event)
+
 
     def test_sync_populates_enabled_chats_from_voice_modes(self, runner):
         """Issue #16007: sync also restores per-chat /voice on|tts opt-ins.
@@ -458,6 +470,18 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 99)
         assert receiver._ssrc_to_user[100] == 99
 
+    def test_live_pcm_only_emits_for_mapped_speaker(self):
+        receiver = self._make_receiver()
+        callback = MagicMock()
+        receiver._live_pcm_callback = callback
+
+        receiver._emit_live_pcm(100, b"pcm")
+        callback.assert_not_called()
+
+        receiver.map_ssrc(100, 42)
+        receiver._emit_live_pcm(100, b"pcm")
+        callback.assert_called_once_with(42, b"pcm")
+
 
     def test_check_silence_returns_completed_utterance(self):
         receiver = self._make_receiver()
@@ -592,6 +616,33 @@ class TestVoiceChannelCommands:
         assert "voice dependencies are missing" in result.lower()
         assert "PyNaCl" in result
 
+    @pytest.mark.asyncio
+    async def test_live_requires_authorized_requester_in_voice_channel(self, runner):
+        event = self._make_discord_event("/voice live")
+        adapter = MagicMock()
+        adapter.get_user_voice_channel = AsyncMock(return_value=None)
+        adapter.start_live_voice = AsyncMock(return_value="Live voice is ready.")
+        runner.adapters[event.source.platform] = adapter
+        runner._is_user_authorized_for_source = MagicMock(return_value=False)
+
+        assert "authorized" in (await runner._handle_voice_channel_live(event)).lower()
+        adapter.get_user_voice_channel.assert_not_awaited()
+
+        runner._is_user_authorized_for_source.return_value = True
+        assert "voice channel" in (await runner._handle_voice_channel_live(event)).lower()
+        adapter.start_live_voice.assert_not_awaited()
+
+        channel = MagicMock()
+        channel.name = "General"
+        channel.guild.id = 111
+        adapter.get_user_voice_channel.return_value = channel
+        assert "ready" in (await runner._handle_voice_channel_live(event)).lower()
+        adapter.start_live_voice.assert_awaited_once()
+        kwargs = adapter.start_live_voice.await_args.kwargs
+        assert kwargs["text_channel_id"] == 123
+        assert kwargs["source"]["chat_id"] == "123"
+        assert callable(kwargs["delegate"])
+
     # -- _handle_voice_channel_leave --
 
 
@@ -648,6 +699,34 @@ class TestVoiceChannelCommands:
         mock_adapter._resolve_channel_prompt.assert_called_once_with("123")
         event = mock_adapter.handle_message.call_args[0][0]
         assert event.channel_prompt == "Be terse in #dev."
+
+    @pytest.mark.asyncio
+    async def test_live_input_reuses_voice_event_path_and_waits_for_final(self, runner):
+        from gateway.config import Platform
+
+        mock_adapter = MagicMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client.get_channel.return_value = mock_channel
+        mock_adapter._resolve_channel_prompt.return_value = "Be terse in #dev."
+        mock_adapter.handle_message_and_wait = AsyncMock(return_value="Exact TARS final text")
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        result = await runner._handle_live_voice_input(
+            111, 42, "Do the work", adapter=mock_adapter,
+        )
+
+        assert result == "Exact TARS final text"
+        mock_channel.send.assert_awaited_once_with("**[Voice]** <@42>: Do the work")
+        event = mock_adapter.handle_message_and_wait.await_args.args[0]
+        assert event.text == "Do the work"
+        assert event.message_type == MessageType.VOICE
+        assert event.source.chat_id == "123"
+        assert event.source.user_id == "42"
+        assert event.channel_prompt == "Be terse in #dev."
+        assert event.metadata["suppress_auto_tts"] is True
+        assert event.allow_gateway_control is False
 
 
     @pytest.mark.asyncio
