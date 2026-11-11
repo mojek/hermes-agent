@@ -544,7 +544,9 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         # No welcome banner (~420 ms cold); session id / resume hint come from _print_exit_summary().
         _query_label = query or ("[image attached]" if single_query_images else "")
         if _query_label:
-            cli.console.print(f"[bold blue]{t('cli.single_query.query_label')}[/] {_query_label}")
+            # The query is user data: a Text renders it literally (no markup, no emoji codes).
+            from rich.text import Text
+            cli.console.print(Text.assemble((t("cli.single_query.query_label"), "bold blue"), " ", _query_label))
         cli._show_security_advisories()
         # Same author contract as `-Q`: a spawner that sets HERMES_TURN_AUTHOR names who wrote this run's
         # prompts. Consumed before the first turn so tool subprocesses never inherit it; every turn of
